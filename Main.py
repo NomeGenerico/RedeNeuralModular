@@ -2,6 +2,12 @@ import numpy as np
 import pickle
 import os
 import struct
+# from tqdm import tqdm
+import time
+from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
+
+
 
 
 
@@ -89,10 +95,12 @@ class NeuronMap:
     def __len__(self):
         return len(self.NMap)
     
+
     def sigmoid(self, x):
         x = np.clip(x, -500, 500)
         return 1 / (1 + np.exp(-x))
     
+
     def ReLU(self,x):
         return max(0,x)
 
@@ -226,24 +234,30 @@ class LayeredRNNModel:
         PLGradMap = self.GradList[Layer - 1]
         CLGradMap = self.GradList[Layer]
         PastCLGradMap = PGradList[Layer - 1]
-        # Combina os mapas PL + CL
+
         CombGradMap = {}
         for id in PLGradMap.keys():
             CombGradMap[id] = PLGradMap[id]
-
         for id in PastCLGradMap.keys():
             CombGradMap[id + len(PLGradMap)] = PastCLGradMap[id]
 
-        for id, neuron in NMap.NMap.items():
+        def process_neuron(id, neuron):
             reducedCombGradMap = [CombGradMap[i] for i in neuron.CombinedIDl]
-            CLGradMap[id] = NMap.ActivationFunction(neuron, reducedCombGradMap)/len(NMap)
-
+            activation = NMap.ActivationFunction(neuron, reducedCombGradMap) / len(NMap)
+            CLGradMap[id] = activation
             if learning_rate != 0:
-                GradList = self.GradList
-                self.LocalBP(Layer, neuron, GradList, learning_rate)
-            
-        return "placehodler"
-  
+                self.LocalBP(Layer, neuron, self.GradList, learning_rate)
+
+        # ☑️ Aqui sim a execução acontece
+        max_threads = 12
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            futures = [executor.submit(process_neuron, id, neuron) for id, neuron in NMap.items()]
+            for future in futures:
+                future.result()
+
+
+            return "placeholder"
+
     def Inference(self,inferenceSteps,INPUT  = False, LOG = True, learning_rate=0, ExpectedOutput = False):
 
          # GradMaps are inference Specific
@@ -402,24 +416,40 @@ class LayeredRNNModel:
                         forward_map[input_id] = []
                     forward_map[input_id].append({neuron.id: weight})
 
-    def Train(self, DATASET, inferenceSteps=10, learning_rate=1):
+    def Train(self, DATASET, inferenceSteps=10, learning_rate=1, Epochs=1):
         x_data, y_labels = DATASET
-        for i in range(len(x_data)):
-            x_input = x_data[i]
-            y_target = y_labels[i]
+        total_samples = len(x_data) * Epochs
 
-            # Alimenta o modelo com o input e ativa aprendizado
-            output = self.Inference(inferenceSteps, x_input, False, learning_rate, y_target)
+        start_time = time.time()
 
-            if i % 10 == 0:
-                print(f"Treinado em {i}/{len(x_data)} amostras")
-                self.SaveModel("mnist_model.pkl")
-    
+        for epoch in range(Epochs):
+            for i in range(len(x_data)):
+                idx = epoch * len(x_data) + i
+                x_input = x_data[i]
+                y_target = y_labels[i]
+
+                # Inference + aprendizado
+                output = self.Inference(inferenceSteps, x_input, False, learning_rate, y_target)
+
+                # A cada 10 amostras, mostra tempo e progresso
+                if idx % 10 == 0 and idx > 0:
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / idx
+                    remaining = total_samples - idx
+                    eta = remaining * avg_time
+
+                    percent = 100 * idx / total_samples
+                    print(f"[{percent:.1f}%] {idx}/{total_samples} amostras — "
+                        f"Tempo: {elapsed:.1f}s — ETA: {eta:.1f}s")
+                    
+                    self.SaveModel("mnist_model.pkl")
+        total_time = time.time() - start_time
+        print(f"\n✅ Treino concluído em {total_time:.1f} segundos.")
+
     def predict(self, image_input, inferenceSteps=10):
         output_map = self.Inference(inferenceSteps, image_input, LOG=False, learning_rate=0)
         output_values = np.array(list(output_map.values()))
         return np.argmax(output_values), output_values
-
 
 def load_mnist_from_folder(folder_path, kind='train', n_samples=None):
     labels_path = os.path.join(folder_path, f'{kind}-labels-idx1-ubyte')
@@ -433,7 +463,12 @@ def load_mnist_from_folder(folder_path, kind='train', n_samples=None):
 
     with open(images_path, 'rb') as imgpath:
         magic, num, rows, cols = struct.unpack('>IIII', imgpath.read(16))
-        images = np.frombuffer(imgpath.read(), dtype=np.uint8).reshape(len(labels), 784)
+        images = np.frombuffer(imgpath.read(), dtype=np.uint8)
+
+        if n_samples:
+            images = images[:n_samples * 784]
+
+        images = images.reshape(len(labels), 784)
         images = images.astype(np.float32) / 255.0  # normaliza [0,1]
 
     # One-hot encode
@@ -442,6 +477,34 @@ def load_mnist_from_folder(folder_path, kind='train', n_samples=None):
         one_hot_labels[i, label] = 1.0
 
     return images, one_hot_labels
+
+def TestModel(model, test_dataset, inferenceSteps=10):
+    x_test, y_test = test_dataset
+    correct = 0
+    total = len(x_test)
+    predicted_list = []
+
+    for i in range(total):
+        x_input = x_test[i]
+        expected_label = np.argmax(y_test[i])  # one-hot decode
+
+        output_map = model.Inference(inferenceSteps, x_input, LOG=False)
+        output_values = list(output_map.items())
+        predicted_label = max(output_values, key=lambda x: x[1])[0]
+        predicted_list.append(predicted_label)
+
+        if predicted_label == expected_label:
+            correct += 1
+
+        if i % 1000 == 0:
+            print(f"[{i}/{total}] Exemplos testados")
+
+    print("\nDistribuição das predições:")
+    print(Counter(predicted_list))
+
+    accuracy = correct / total
+    print(f"\n🎯 Acurácia no conjunto de teste: {accuracy * 100:.6f}%")
+
 
 
 
@@ -455,6 +518,12 @@ inferenceSteps = 10
 # Model.SaveModel()
 # print(output.values())
 # print(len(Model.History))
-DATASET = load_mnist_from_folder("DATASETS/MINST")
-Model.Train(DATASET)
-Model.SaveModel()
+
+TRAININGDATASET = load_mnist_from_folder("DATASETS/MINST","train",500)
+TESTINGDATASET = load_mnist_from_folder("DATASETS/MINST","t10k",500)
+# print(TRAININGDATASET[0][0])
+# print(TESTINGDATASET[1][0])
+# Model.Train(TRAININGDATASET)  # só 500 para testar performance
+Model.LoadModel()
+Model.Train(TRAININGDATASET)
+TestModel(Model, TRAININGDATASET)
